@@ -3540,6 +3540,10 @@ Range: Minimum 12000 (12 secs) when supporting PBF.
 #define AVRC_ADV_CTRL_INCLUDED      TRUE
 #endif
 
+#ifndef AVRC_CTLR_INCLUDED
+#define AVRC_CTLR_INCLUDED          TRUE
+#endif
+
 #ifndef SDP_AVRCP_1_5
 #define SDP_AVRCP_1_5               FALSE
 

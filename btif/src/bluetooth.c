@@ -139,8 +139,10 @@ extern btpan_interface_t *btif_pan_get_interface();
 extern btmce_interface_t *btif_mce_get_interface();
 /* gatt */
 extern btgatt_interface_t *btif_gatt_get_interface();
-/* avrc */
+/* avrc target */
 extern btrc_interface_t *btif_rc_get_interface();
+/* avrc controller */
+extern btrc_interface_t *btif_rc_ctrl_get_interface();
 /*wipower*/
 extern wipower_interface_t *get_wipower_interface();
 
@@ -431,6 +433,9 @@ static const void* get_profile_interface (const char *profile_id)
 
     if (is_profile(profile_id, BT_PROFILE_AV_RC_ID))
         return btif_rc_get_interface();
+
+    if (is_profile(profile_id, BT_PROFILE_AV_RC_CTRL_ID))
+        return btif_rc_ctrl_get_interface();
 
     if (is_profile(profile_id, WIPOWER_PROFILE_ID))
         return get_wipower_interface();

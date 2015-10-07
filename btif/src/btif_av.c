@@ -117,6 +117,7 @@ else\
     case BTA_AV_META_MSG_EVT: \
     case BTA_AV_BROWSE_MSG_EVT: \
     case BTA_AV_RC_FEAT_EVT: \
+    case BTA_AV_REMOTE_RSP_EVT: \
     { \
          btif_rc_handler(e, d);\
     }break; \
@@ -380,6 +381,7 @@ static BOOLEAN btif_av_state_idle_handler(btif_sm_event_t event, void *p_data)
         case BTA_AV_META_MSG_EVT:
         case BTA_AV_RC_FEAT_EVT:
         case BTA_AV_BROWSE_MSG_EVT:
+        case BTA_AV_REMOTE_RSP_EVT:
             btif_rc_handler(event, (tBTA_AV*)p_data);
             break;
 
@@ -473,6 +475,8 @@ static BOOLEAN btif_av_state_opening_handler(btif_sm_event_t event, void *p_data
             /* if queued PLAY command,  send it now */
             btif_rc_check_handle_pending_play(p_bta_data->open.bd_addr,
                                              (p_bta_data->open.status == BTA_AV_SUCCESS));
+            /* Bring up AVRCP connection too */
+            BTA_AvOpenRc(btif_av_cb.bta_handle);
             btif_queue_advance();
         } break;
 
