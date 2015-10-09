@@ -51,8 +51,6 @@ LOCAL_SRC_FILES += \
     ../btif/src/btif_gatt_test.c \
     ../btif/src/btif_config.c \
     ../btif/src/btif_config_util.cpp \
-    ../btif/src/btif_profile_queue.c \
-    ../btif/src/bluetoothTrack.cpp \
     ../btif/src/btif_l2cap.c \
     ../btif/src/btif_sdp.c \
     ../wipowerif/src/wipower.c \
@@ -106,12 +104,12 @@ LOCAL_C_INCLUDES+= . \
 	$(LOCAL_PATH)/../hci/include\
 	$(LOCAL_PATH)/../brcm/include \
 	$(LOCAL_PATH)/../embdrv/sbc/encoder/include \
+	$(LOCAL_PATH)/../embdrv/sbc/decoder/include \
 	$(LOCAL_PATH)/../audio_a2dp_hw \
 	$(LOCAL_PATH)/../utils/include \
 	$(LOCAL_PATH)/../wipowerif/include \
 	$(bdroid_C_INCLUDES) \
 	$(TARGET_OUT_HEADERS)/codecs/decoder/inc \
-	$(TOP)/frameworks/av/include/media \
 	external/tinyxml2
 
 LOCAL_CFLAGS += -DBUILDCFG $(bdroid_CFLAGS) -Werror -Wno-error=maybe-uninitialized -Wno-error=uninitialized -Wno-unused-parameter
@@ -144,7 +142,7 @@ LOCAL_SHARED_LIBRARIES := \
     libmedia
 
 #LOCAL_WHOLE_STATIC_LIBRARIES := libbt-brcm_gki libbt-brcm_stack libbt-brcm_bta
-LOCAL_STATIC_LIBRARIES := libbt-brcm_gki libbt-brcm_bta libbt-brcm_stack libbt-btc libtinyxml2
+LOCAL_STATIC_LIBRARIES := libbt-brcm_gki libbt-brcm_bta libbt-brcm_stack libbt-btc libtinyxml2 libbt-qcom_sbc_decoder
 
 LOCAL_MODULE := bluetooth.default
 LOCAL_MODULE_PATH := $(TARGET_OUT_SHARED_LIBRARIES)/hw

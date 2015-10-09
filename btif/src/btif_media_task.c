@@ -80,7 +80,6 @@
 #endif
 #include "stdio.h"
 #include <dlfcn.h>
-#include "bluetoothTrack.h"
 
 //#define DEBUG_MEDIA_AV_FLOW TRUE
 
@@ -88,8 +87,6 @@
 OI_CODEC_SBC_DECODER_CONTEXT context;
 OI_UINT32 contextData[CODEC_DATA_WORDS(2, SBC_CODEC_FAST_FILTER_BUFFERS)];
 OI_INT16 pcmData[15*SBC_MAX_SAMPLES_PER_FRAME*SBC_MAX_CHANNELS];
-void *dlhandle = NULL;
-oi_sbc_decoder_vendor_interface_t *oi_sbc_decode_vnd_if = NULL;
 #endif
 
 #ifdef BT_AUDIO_SYSTRACE_LOG
@@ -295,9 +292,11 @@ typedef struct
     BOOLEAN rx_flush; /* discards any incoming data when true */
     BOOLEAN scaling_disabled;
     BOOLEAN is_edr_supported;
-    BOOLEAN is_source;
+    UINT8 peer_sep;
+    BOOLEAN data_channel_open;
     UINT8   frames_to_process;
-    BOOLEAN rx_audio_focus_gained;
+    UINT32  sample_rate;
+    UINT8   channel_count;
 #endif
 
 } tBTIF_MEDIA_CB;
@@ -328,7 +327,17 @@ static void btif_a2dp_encoder_update(void);
 const char* dump_media_event(UINT16 event);
 static UINT8 check_for_max_number_of_frames_per_packet();
 #ifdef BTA_AVK_INCLUDED
-void btif_load_decoder_library();
+extern OI_STATUS OI_CODEC_SBC_DecodeFrame(OI_CODEC_SBC_DECODER_CONTEXT *context,
+                                          const OI_BYTE **frameData,
+                                          unsigned long *frameBytes,
+                                          OI_INT16 *pcmData,
+                                          unsigned long *pcmBytes);
+extern OI_STATUS OI_CODEC_SBC_DecoderReset(OI_CODEC_SBC_DECODER_CONTEXT *context,
+                                           unsigned long *decoderData,
+                                           unsigned long decoderDataBytes,
+                                           OI_UINT8 maxChannels,
+                                           OI_UINT8 pcmStride,
+                                           OI_BOOL enhanced);
 #endif
 static void btif_media_flush_q(BUFFER_Q *p_q);
 static void btif_media_task_aa_handle_stop_decoding(void );
@@ -363,7 +372,6 @@ static void btif_media_task_aa_handle_clear_track(void);
 static void btif_media_task_aa_handle_start_decoding(void );
 #endif
 extern BOOLEAN btif_hf_is_call_idle();
-extern void btif_av_request_audio_focus(BOOLEAN enable);
 
 BOOLEAN btif_media_task_start_decoding_req(void);
 BOOLEAN btif_media_task_clear_track(void);
@@ -586,6 +594,9 @@ static void btif_recv_ctrl_data(void)
 
                 /* post start event and wait for audio path to open */
                 btif_dispatch_sm_event(BTIF_AV_START_STREAM_REQ_EVT, NULL, 0);
+
+                //FIXME
+                a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
             }
             else if (btif_av_stream_started_ready())
             {
@@ -604,7 +615,7 @@ static void btif_recv_ctrl_data(void)
 
         case A2DP_CTRL_CMD_STOP:
 
-            if (btif_media_cb.is_tx_timer == FALSE)
+            if (btif_media_cb.peer_sep == AVDT_TSEP_SNK && btif_media_cb.is_tx_timer == FALSE)
             {
                 /* we are already stopped, just ack back */
                 a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
@@ -612,6 +623,7 @@ static void btif_recv_ctrl_data(void)
             }
 
             btif_dispatch_sm_event(BTIF_AV_STOP_STREAM_REQ_EVT, NULL, 0);
+            a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
             break;
 
         case A2DP_CTRL_CMD_SUSPEND:
@@ -629,6 +641,17 @@ static void btif_recv_ctrl_data(void)
                 a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
             }
             break;
+
+        case A2DP_CTRL_GET_AUDIO_CONFIG:
+        {
+            uint32_t sample_rate = btif_media_cb.sample_rate;
+            uint8_t channel_count = btif_media_cb.channel_count;
+
+            a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
+            UIPC_Send(UIPC_CH_ID_AV_CTRL, 0, (UINT8 *)&sample_rate, 4);
+            UIPC_Send(UIPC_CH_ID_AV_CTRL, 0, &channel_count, 1);
+            break;
+        }
 
         default:
             APPL_TRACE_ERROR1("UNSUPPORTED CMD (%d)", cmd);
@@ -677,11 +700,14 @@ static void btif_a2dp_data_cb(tUIPC_CH_ID ch_id, tUIPC_EVENT event)
                 connection events */
             UIPC_Ioctl(UIPC_CH_ID_AV_AUDIO, UIPC_REG_REMOVE_ACTIVE_READSET, NULL);
 
-            /* Start the media task to encode SBC */
-            btif_media_task_start_aa_req();
+            if (btif_media_cb.peer_sep == AVDT_TSEP_SNK) {
+                /* Start the media task to encode SBC */
+                btif_media_task_start_aa_req();
 
-            /* make sure we update any changed sbc encoder params */
-            btif_a2dp_encoder_update();
+                /* make sure we update any changed sbc encoder params */
+                btif_a2dp_encoder_update();
+            }
+            btif_media_cb.data_channel_open = TRUE;
 
             /* ack back when media task is fully started */
             break;
@@ -689,6 +715,7 @@ static void btif_a2dp_data_cb(tUIPC_CH_ID ch_id, tUIPC_EVENT event)
         case UIPC_CLOSE_EVT:
             a2dp_cmd_acknowledge(A2DP_CTRL_ACK_SUCCESS);
             btif_audiopath_detached();
+            btif_media_cb.data_channel_open = FALSE;
             break;
 
         default :
@@ -940,7 +967,7 @@ tBTIF_STATUS btif_a2dp_setup_codec(void)
 void btif_a2dp_on_idle(void)
 {
     APPL_TRACE_EVENT0("## ON A2DP IDLE ##");
-    if(btif_media_cb.is_source)
+    if (btif_media_cb.peer_sep == AVDT_TSEP_SNK)
     {
         /* Make sure media task is stopped */
         btif_media_task_stop_aa_req();
@@ -948,16 +975,13 @@ void btif_a2dp_on_idle(void)
 
     bta_av_co_init();
 #ifdef BTA_AVK_INCLUDED
-    if (!btif_media_cb.is_source)
+    if (btif_media_cb.peer_sep == AVDT_TSEP_SRC)
     {
         btif_media_cb.rx_flush = TRUE;
         btif_media_task_aa_rx_flush_req();
         btif_media_task_stop_decoding_req();
         btif_media_task_clear_track();
         APPL_TRACE_DEBUG0("Stopped BT track");
-        APPL_TRACE_DEBUG0("Reset to Source role");
-        btif_media_cb.is_source = TRUE;
-        btif_media_cb.rx_audio_focus_gained = BTIF_MEDIA_AUDIOFOCUS_LOSS;
     }
 #endif
 }
@@ -1172,11 +1196,13 @@ void btif_a2dp_ack_fail(void)
 void btif_a2dp_on_stopped(tBTA_AV_SUSPEND *p_av)
 {
     APPL_TRACE_EVENT0("## ON A2DP STOPPED ##");
-    if ((!btif_media_cb.is_source)) /*  Handling for A2DP SINK cases*/
+    if (btif_media_cb.peer_sep == AVDT_TSEP_SRC) /*  Handling for A2DP SINK cases*/
     {
         btif_media_cb.rx_flush = TRUE;
         btif_media_task_aa_rx_flush_req();
         btif_media_task_stop_decoding_req();
+        UIPC_Close(UIPC_CH_ID_AV_AUDIO);
+        btif_media_cb.data_channel_open = FALSE;
         return;
     }
     /* allow using this api for other than suspend */
@@ -1216,7 +1242,7 @@ void btif_a2dp_on_stopped(tBTA_AV_SUSPEND *p_av)
 void btif_a2dp_on_suspended(tBTA_AV_SUSPEND *p_av)
 {
     APPL_TRACE_EVENT0("## ON A2DP SUSPENDED ##");
-    if ((!btif_media_cb.is_source))
+    if (btif_media_cb.peer_sep == AVDT_TSEP_SRC)
     {
         btif_media_cb.rx_flush = TRUE;
         btif_media_task_aa_rx_flush_req();
@@ -1252,13 +1278,6 @@ void btif_a2dp_set_tx_flush(BOOLEAN enable)
 {
     APPL_TRACE_EVENT1("## DROP TX %d ##", enable);
     btif_media_cb.tx_flush = enable;
-}
-
-/* when true media task discards any rx frames */
-void btif_a2dp_set_audio_focus_state(btif_media_AudioFocus_state state)
-{
-    APPL_TRACE_EVENT1("## Audio_focus_state Rx %d ##", state);
-    btif_media_cb.rx_audio_focus_gained = state;
 }
 
 /*****************************************************************************
@@ -1323,18 +1342,7 @@ static void btif_media_task_avk_handle_timer ( void )
             btif_media_flush_q(&(btif_media_cb.RxSbcQ));
             return;
         }
-        if (btif_media_cb.rx_audio_focus_gained == BTIF_MEDIA_AUDIOFOCUS_LOSS_TRANSIENT)
-        {
-            APPL_TRACE_DEBUG0("Received Transient Focus Loss, Ignoring");
-            return;
-        }
 
-        if (btif_media_cb.rx_audio_focus_gained == BTIF_MEDIA_AUDIOFOCUS_LOSS)
-        {
-            /* Send a Audio Focus Request */
-            btif_av_request_audio_focus(TRUE);
-            return;
-        }
         if (btif_media_cb.RxSbcQ.count > 3)
             num_frames_to_process = 2* btif_media_cb.frames_to_process;
         else
@@ -1454,8 +1462,6 @@ void btif_media_task_init(void)
 #if (BTA_AV_INCLUDED == TRUE)
     UIPC_Open(UIPC_CH_ID_AV_CTRL , btif_a2dp_ctrl_cb);
 #endif
-    btif_media_cb.is_source = TRUE;
-    APPL_TRACE_DEBUG0("Reset to Source role");
 }
 /*******************************************************************************
  **
@@ -1582,7 +1588,7 @@ BOOLEAN btif_media_task_send_cmd_evt(UINT16 Evt)
  *******************************************************************************/
 static void btif_media_flush_q(BUFFER_Q *p_q)
 {
-    while (GKI_IS_QUEUE_EMPTY(p_q) == FALSE)
+    while (GKI_queue_is_empty(p_q) == FALSE)
     {
         GKI_freebuf(GKI_dequeue(p_q));
     }
@@ -1673,21 +1679,27 @@ static void btif_media_task_handle_inc_media(tBT_SBC_HDR*p_msg)
     OI_STATUS status;
     int num_sbc_frames = p_msg->num_frames_to_be_processed;
     UINT32 sbc_frame_len = p_msg->len - 1;
-    int retwriteAudioTrack = 0;
     availPcmBytes = 2*sizeof(pcmData);
 
-    if ((btif_media_cb.is_source) || (btif_media_cb.rx_flush))
+    if ((btif_media_cb.peer_sep == AVDT_TSEP_SNK) || (btif_media_cb.rx_flush))
     {
         APPL_TRACE_DEBUG0(" State Changed happened in this tick ");
         return;
     }
+
+    // ignore data if no one is listening
+    if (!btif_media_cb.data_channel_open)
+        return;
+
     APPL_TRACE_DEBUG2("Number of sbc frames %d, frame_len %d", num_sbc_frames, sbc_frame_len);
 
     for(count = 0; count < num_sbc_frames && sbc_frame_len != 0; count ++)
     {
         pcmBytes = availPcmBytes;
-        status = oi_sbc_decode_vnd_if->OI_CODEC_SBC_DecodeFrame(&context, (const OI_BYTE**)&sbc_start_frame,
-                                                        &sbc_frame_len, pcmDataPointer, &pcmBytes);
+        status = OI_CODEC_SBC_DecodeFrame(&context, (const OI_BYTE**)&sbc_start_frame,
+                                                                (OI_UINT32 *)&sbc_frame_len,
+                                                                (OI_INT16 *)pcmDataPointer,
+                                                                (OI_UINT32 *)&pcmBytes);
         if (!OI_SUCCESS(status)) {
             APPL_TRACE_ERROR1("Decoding failure: %d\n", status);
             break;
@@ -1698,7 +1710,7 @@ static void btif_media_task_handle_inc_media(tBT_SBC_HDR*p_msg)
         p_msg->len = sbc_frame_len + 1;
     }
 
-    retwriteAudioTrack = btWriteData((void*)pcmData, (2*sizeof(pcmData) - availPcmBytes));
+    UIPC_Send(UIPC_CH_ID_AV_AUDIO, 0, (UINT8 *)pcmData, (2*sizeof(pcmData) - availPcmBytes));
     APPL_TRACE_LATENCY_AUDIO1("Written to audio, seq number %d", p_msg->layer_specific);
 }
 #endif
@@ -2236,7 +2248,7 @@ static void btif_media_task_audio_feeding_init(BT_HDR *p_msg)
     }
 }
 
-int a2dp_get_track_frequency(UINT8 frequency) {
+int btif_a2dp_get_track_frequency(UINT8 frequency) {
     int freq = 48000;
     switch (frequency) {
         case A2D_SBC_IE_SAMP_FREQ_16:
@@ -2255,19 +2267,23 @@ int a2dp_get_track_frequency(UINT8 frequency) {
     return freq;
 }
 
-int a2dp_get_track_channel_type(UINT8 channeltype) {
-    int channel = AUDIO_CHANNEL_OUT_MONO;
+int btif_a2dp_get_track_channel_count(UINT8 channeltype) {
+    int count = 1;
     switch (channeltype) {
         case A2D_SBC_IE_CH_MD_MONO:
-            channel = AUDIO_CHANNEL_OUT_MONO;
+            count = 1;
             break;
         case A2D_SBC_IE_CH_MD_DUAL:
         case A2D_SBC_IE_CH_MD_STEREO:
         case A2D_SBC_IE_CH_MD_JOINT:
-            channel = AUDIO_CHANNEL_OUT_STEREO;
+            count = 2;
             break;
     }
-    return channel;
+    return count;
+}
+
+void btif_a2dp_set_peer_sep(UINT8 sep) {
+    btif_media_cb.peer_sep = sep;
 }
 
 /*******************************************************************************
@@ -2283,7 +2299,6 @@ static void btif_media_task_aa_handle_stop_decoding(void )
 {
     btif_media_cb.is_rx_timer = FALSE;
     GKI_stop_timer(BTIF_MEDIA_AVK_TASK_TIMER_ID);
-    btPauseTrack();
 }
 
 /*******************************************************************************
@@ -2299,7 +2314,6 @@ static void btif_media_task_aa_handle_start_decoding(void )
 {
     if(btif_media_cb.is_rx_timer == TRUE)
         return;
-    btStartTrack();
     btif_media_cb.is_rx_timer = TRUE;
     GKI_start_timer(BTIF_MEDIA_AVK_TASK_TIMER_ID, GKI_MS_TO_TICKS(BTIF_SINK_MEDIA_TIME_TICK), TRUE);
 }
@@ -2309,15 +2323,6 @@ static void btif_media_task_aa_handle_start_decoding(void )
 static void btif_media_task_aa_handle_clear_track (void)
 {
     APPL_TRACE_DEBUG0("btif_media_task_aa_handle_clear_track");
-    btStopTrack();
-    btDeleteTrack();
-    if (dlhandle)
-    {
-        APPL_TRACE_DEBUG0("Unload Decoder lib");
-        dlclose(dlhandle);
-        dlhandle = NULL;
-        oi_sbc_decode_vnd_if = NULL;
-    }
 }
 
 /*******************************************************************************
@@ -2335,10 +2340,9 @@ static void btif_media_task_aa_handle_decoder_reset(BT_HDR *p_msg)
     tA2D_STATUS a2d_status;
     tA2D_SBC_CIE sbc_cie;
     OI_STATUS       status;
-    UINT32          freq_multiple; /* frequency multiple for 20ms of data */
-    UINT32          num_blocks;
-    UINT32          num_subbands;
-    UINT32          num_channel;
+    UINT32          freq_multiple = 48*20; /* frequency multiple for 20ms of data , initialize with 48K*/
+    UINT32          num_blocks = 16;
+    UINT32          num_subbands = 8;
 
     APPL_TRACE_DEBUG6("btif_media_task_aa_handle_decoder_reset p_codec_info[%x:%x:%x:%x:%x:%x]",
             p_buf->codec_info[1], p_buf->codec_info[2], p_buf->codec_info[3],
@@ -2350,19 +2354,18 @@ static void btif_media_task_aa_handle_decoder_reset(BT_HDR *p_msg)
         APPL_TRACE_ERROR1("ERROR dump_codec_info A2D_ParsSbcInfo fail:%d", a2d_status);
         return;
     }
-    btif_media_cb.is_source = FALSE;
+
+    btif_media_cb.sample_rate = btif_a2dp_get_track_frequency(sbc_cie.samp_freq);
+    btif_media_cb.channel_count = btif_a2dp_get_track_channel_count(sbc_cie.ch_mode);
+
     btif_media_cb.rx_flush = FALSE;
     APPL_TRACE_DEBUG0("Reset to sink role");
-    btif_load_decoder_library();
-    status = oi_sbc_decode_vnd_if->OI_CODEC_SBC_DecoderReset(&context, contextData, sizeof(contextData), 2, 2, FALSE);
+    status = OI_CODEC_SBC_DecoderReset(&context, contextData, sizeof(contextData), 2, 2, FALSE);
     if (!OI_SUCCESS(status)) {
         APPL_TRACE_ERROR1("OI_CODEC_SBC_DecoderReset failed with error code %d\n", status);
     }
-    APPL_TRACE_DEBUG0("A2dpSink: Crate Track");
-    if (btCreateTrack(a2dp_get_track_frequency(sbc_cie.samp_freq), a2dp_get_track_channel_type(sbc_cie.ch_mode)) == -1) {
-        APPL_TRACE_ERROR0("A2dpSink: Track creation fails!!!");
-        return;
-    }
+
+    UIPC_Open(UIPC_CH_ID_AV_AUDIO, btif_a2dp_data_cb);
 
     switch(sbc_cie.samp_freq)
     {
@@ -3311,23 +3314,3 @@ void dump_codec_info(unsigned char *p_codec)
     APPL_TRACE_DEBUG2("\tBit pool Min:%d Max:%d", sbc_cie.min_bitpool, sbc_cie.max_bitpool);
 
 }
-
-#ifdef BTA_AVK_INCLUDED
-void btif_load_decoder_library()
-{
-    dlhandle = dlopen("liboi_sbc_decoder.so", RTLD_NOW);
-    APPL_TRACE_DEBUG0("Load decoder library");
-    if (!dlhandle)
-    {
-        APPL_TRACE_ERROR0("!!! Failed to load oi_sbc_decoder.so !!!");
-        return;
-    }
-
-    oi_sbc_decode_vnd_if = (oi_sbc_decoder_vendor_interface_t *) dlsym(dlhandle, "OI_SBC_DECODER_VENDOR_LIB_INTERFACE");
-    if (!oi_sbc_decode_vnd_if)
-    {
-        APPL_TRACE_ERROR0("!!! Failed to get oi sbc decode vendor interface !!!");
-        return;
-    }
-}
-#endif
